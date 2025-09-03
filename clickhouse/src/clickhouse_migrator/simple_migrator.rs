@@ -371,10 +371,6 @@ impl SimpleMigrator {
         statements
     }
     
-
-    
-
-    
     /// 从数据库获取已应用的迁移版本
     async fn get_applied_versions_from_database(&self) -> Result<HashSet<String>> {
         let mut applied_versions = HashSet::new();
@@ -429,14 +425,6 @@ impl SimpleMigrator {
         
         Ok(applied_versions)
     }
-    
-
-    
-
-    
-
-    
-
     
     /// 保存迁移记录
     async fn save_migration_record(&self, record: &MigrationRecord) -> Result<()> {
