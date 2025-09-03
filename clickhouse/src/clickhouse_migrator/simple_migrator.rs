@@ -1,4 +1,3 @@
-use clickhouse::Client;
 use anyhow::{Result, Context};
 use std::collections::{BTreeMap, HashSet};
 use serde::{Deserialize, Serialize};
