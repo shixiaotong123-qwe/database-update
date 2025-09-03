@@ -1,8 +1,41 @@
 use anyhow::Result;
 use clickhouse::Client;
+use std::sync::Arc;
 
 pub struct ClickHouseDB {
     client: Client,
+}
+
+/// 连接管理器，提供共享的 ClickHouse 连接
+pub struct ClickHouseConnectionManager {
+    client: Arc<Client>,
+}
+
+impl ClickHouseConnectionManager {
+    /// 创建新的连接管理器
+    pub fn new(database_url: &str, database: &str, user: &str, password: &str) -> Result<Self> {
+        let client = Client::default()
+            .with_url(database_url)
+            .with_database(database)
+            .with_user(user)
+            .with_password(password);
+
+        Ok(Self {
+            client: Arc::new(client),
+        })
+    }
+
+    /// 获取共享的客户端引用
+    pub fn get_client(&self) -> Arc<Client> {
+        Arc::clone(&self.client)
+    }
+
+    /// 创建 ClickHouseDB 实例（使用共享连接）
+    pub fn create_db(&self) -> ClickHouseDB {
+        ClickHouseDB {
+            client: self.client.as_ref().clone(),
+        }
+    }
 }
 
 impl ClickHouseDB {

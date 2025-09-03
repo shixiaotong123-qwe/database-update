@@ -1,180 +1,166 @@
-# ClickHouse 数据库连接器
+# ClickHouse 数据库连接器和迁移工具
 
-一个现代化的 ClickHouse 数据库连接器，支持自动数据库迁移管理。
+## 🚀 概述
 
-## ✨ 特性
+这是一个 ClickHouse 数据库连接器和迁移工具，采用连接管理器架构，避免重复创建数据库连接。
 
-- 🔄 **自动迁移管理** - 程序启动时自动检查并执行待处理的迁移文件
-- 🚀 **零配置启动** - 使用合理的默认配置，开箱即用
-- 🔧 **灵活配置** - 支持环境变量配置
-- 📊 **实时状态监控** - 显示迁移执行状态和结果
-- 🛡️ **错误处理** - 优雅处理迁移失败情况
+## 🏗️ 架构设计
 
-## 🚀 快速开始
+### 连接管理器模式
 
-### 1. 安装依赖
+为了避免重复创建 ClickHouse 连接，我们采用了连接管理器模式：
 
-```bash
-# 确保已安装 Rust
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+```rust
+// 创建连接管理器（只创建一次连接）
+let connection_manager = ClickHouseConnectionManager::new(
+    "http://localhost:8123",
+    "default", 
+    "default", 
+    "ClickHouse@123"
+)?;
 
-# 克隆项目
-git clone <your-repo>
-cd clickhouse
+// 使用连接管理器创建数据库实例
+let db = connection_manager.create_db();
+
+// 使用连接管理器创建迁移器
+let migrator = SimpleMigrator::new(
+    "http://localhost:8123",
+    "my_service",
+    "migrations"
+).await?;
 ```
 
-### 2. 配置环境变量（可选）
+### 核心组件
 
-创建 `.env` 文件：
+1. **`ClickHouseConnectionManager`** - 连接管理器
+   - 管理单个 ClickHouse 客户端连接
+   - 提供共享连接给多个组件使用
+   - 避免重复创建连接
 
-```bash
-# ClickHouse 数据库连接配置
-CLICKHOUSE_URL=http://localhost:8123
-CLICKHOUSE_SERVICE=clickhouse_service
-CLICKHOUSE_MIGRATIONS=./migrations
+2. **`ClickHouseDB`** - 数据库操作封装
+   - 提供基本的数据库操作方法
+   - 使用共享连接进行数据库操作
+
+3. **`SimpleMigrator`** - 迁移工具
+   - 自动扫描和执行迁移文件
+   - 使用共享连接进行迁移操作
+   - 支持版本控制和回滚
+
+## 🔧 使用方法
+
+### 基本连接
+
+```rust
+use clickhouse_connector::database::ClickHouseConnectionManager;
+
+// 创建连接管理器
+let connection_manager = ClickHouseConnectionManager::new(
+    "http://localhost:8123",
+    "default", 
+    "default", 
+    "ClickHouse@123"
+)?;
+
+// 创建数据库实例
+let db = connection_manager.create_db();
+
+// 测试连接
+let is_connected = db.test_connection().await?;
 ```
 
-### 3. 运行程序
+### 数据库迁移
 
-```bash
-# 方式1: 使用脚本（推荐）
-./run.sh
+```rust
+use clickhouse_connector::clickhouse_migrator::SimpleMigrator;
 
-# 方式2: 直接运行
-cargo run
+// 创建迁移器
+let migrator = SimpleMigrator::new(
+    "http://localhost:8123",
+    "my_service",
+    "migrations"
+).await?;
 
-# 方式3: 指定二进制目标
-cargo run --bin clickhouse_connector
+// 运行迁移
+let result = migrator.migrate().await?;
 ```
 
-## 🔄 自动迁移机制
-
-### 工作原理
-
-1. **程序启动时**自动检查 `./migrations/` 目录
-2. **扫描迁移文件**，识别待执行的迁移
-3. **按版本顺序执行**，确保迁移顺序正确
-4. **记录执行状态**，避免重复执行
-5. **显示执行结果**，包括成功和失败的迁移
-
-### 迁移文件格式
+## 📁 迁移文件格式
 
 迁移文件命名格式：`V{版本号}__{描述}.sql`
 
-```sql
--- V001__create_users_table.sql
+例如：
+- `V000__baseline_existing_database.sql`
+- `V001__create_users_table.sql`
+- `V002__add_user_status_column.sql`
 
--- +migrate Up
-CREATE TABLE users (
-    id UInt32,
-    name String,
-    email String
-) ENGINE = MergeTree()
-ORDER BY id;
+## 🚀 运行
 
--- +migrate Down
-DROP TABLE users;
+```bash
+# 编译
+cargo build
+
+# 运行
+cargo run
+
+# 或者使用脚本
+./run.sh
 ```
 
-### 迁移状态管理
+## 🔍 环境变量
 
-程序会自动创建 `migrations` 表来跟踪迁移状态：
+- `CLICKHOUSE_URL` - ClickHouse 服务器地址（默认：http://localhost:8123）
+- `CLICKHOUSE_DATABASE` - 数据库名称（默认：default）
+- `CLICKHOUSE_USER` - 用户名（默认：default）
+- `CLICKHOUSE_PASSWORD` - 密码（默认：ClickHouse@123）
 
-```sql
-CREATE TABLE migrations (
-    version String,
-    name String,
-    executed_at DateTime,
-    checksum String
-) ENGINE = MergeTree()
-ORDER BY version;
+## 💡 优势
+
+1. **避免重复连接** - 使用连接管理器，只创建一次连接
+2. **资源共享** - 多个组件共享同一个数据库连接
+3. **配置统一** - 所有组件使用相同的连接配置
+4. **易于维护** - 连接逻辑集中管理，便于修改和扩展
+
+## 🐛 故障排除
+
+### 连接问题
+
+如果遇到连接问题，请检查：
+1. ClickHouse 服务是否运行
+2. 网络连接是否正常
+3. 认证信息是否正确
+
+### 迁移问题
+
+如果迁移失败，请检查：
+1. 迁移文件格式是否正确
+2. SQL 语法是否正确
+3. 数据库权限是否足够
+
+## 📝 开发说明
+
+### 添加新的数据库操作
+
+在 `ClickHouseDB` 中添加新方法：
+
+```rust
+impl ClickHouseDB {
+    pub async fn new_operation(&self) -> Result<()> {
+        // 使用 self.client 进行操作
+        Ok(())
+    }
+}
 ```
 
-## 📁 项目结构
+### 扩展迁移功能
 
+在 `SimpleMigrator` 中添加新功能：
+
+```rust
+impl SimpleMigrator {
+    pub async fn new_migration_feature(&self) -> Result<()> {
+        let client = self.connection_manager.get_client();
+        // 使用 client 进行操作
+        Ok(())
+    }
+}
 ```
-clickhouse/
-├── src/
-│   ├── main.rs                 # 主程序入口（包含自动迁移逻辑）
-│   ├── lib.rs                  # 库入口
-│   ├── clickhouse_migrator/    # 迁移器实现
-│   ├── database.rs             # 数据库连接逻辑
-│   └── models.rs               # 数据模型
-├── migrations/                 # 迁移文件目录
-├── run.sh                     # 运行脚本
-└── Cargo.toml                 # 项目配置
-```
-
-## 🔧 配置选项
-
-### 环境变量
-
-| 变量名 | 默认值 | 说明 |
-|--------|--------|------|
-| `CLICKHOUSE_URL` | `http://localhost:8123` | ClickHouse 服务器地址 |
-| `CLICKHOUSE_SERVICE` | `clickhouse_service` | 服务标识符 |
-| `CLICKHOUSE_MIGRATIONS` | `./migrations` | 迁移文件目录 |
-
-### 命令行参数
-
-程序现在**不需要**任何命令行参数，所有操作都是自动的。
-
-## 📊 输出示例
-
-```
-🚀 ClickHouse 数据库连接器启动中...
-🔧 配置信息:
-  数据库 URL: http://localhost:8123
-  服务名称: clickhouse_service
-  迁移路径: ./migrations
-
-正在连接ClickHouse数据库...
-✅ 成功连接到ClickHouse数据库！
-
-📊 数据库信息:
-数据库名称: default
-用户名: default
-主机: http://localhost:8123
-
-🚀 自动检查并执行数据库迁移...
-📊 当前迁移状态:
-  服务名称: clickhouse_service
-  迁移表: migrations
-  总迁移数: 5
-
-✅ 没有待处理的迁移，数据库已是最新状态
-
-🔍 查询表结构...
-...
-🎉 ClickHouse数据库操作完成！
-
-💡 提示: 程序启动时会自动检查并执行迁移，无需手动操作
-```
-
-## 🚨 故障排除
-
-### 常见问题
-
-1. **连接失败**
-   - 检查 ClickHouse 服务是否运行
-   - 验证连接 URL 和认证信息
-
-2. **迁移失败**
-   - 检查迁移文件语法
-   - 查看错误日志
-   - 确保数据库权限足够
-
-3. **权限问题**
-   - 确保用户有创建表的权限
-   - 检查数据库访问权限
-
-## 🔮 未来计划
-
-- [ ] 支持迁移回滚
-- [ ] 添加迁移验证
-- [ ] 支持分布式迁移
-- [ ] 添加迁移测试框架
-
-## �� 许可证
-
-MIT License

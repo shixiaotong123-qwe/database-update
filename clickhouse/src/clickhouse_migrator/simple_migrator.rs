@@ -3,9 +3,10 @@ use anyhow::{Result, Context};
 use std::collections::{BTreeMap, HashSet};
 use serde::{Deserialize, Serialize};
 use std::time::Instant;
+use crate::database::ClickHouseConnectionManager;
 
 pub struct SimpleMigrator {
-    client: Client,
+    connection_manager: ClickHouseConnectionManager,
     service_name: String,
     migrations_path: String,
 }
@@ -47,14 +48,15 @@ pub struct FailedMigration {
 
 impl SimpleMigrator {
     pub async fn new(database_url: &str, service_name: &str, migrations_path: &str) -> Result<Self> {
-        let client = Client::default()
-            .with_url(database_url)
-            .with_database("default")
-            .with_user("default")
-            .with_password("ClickHouse@123");
+        let connection_manager = ClickHouseConnectionManager::new(
+            database_url, 
+            "default", 
+            "default", 
+            "ClickHouse@123"
+        )?;
         
         let migrator = Self {
-            client,
+            connection_manager,
             service_name: service_name.to_string(),
             migrations_path: migrations_path.to_string(),
         };
@@ -84,7 +86,8 @@ impl SimpleMigrator {
             "#
         );
         
-        self.client.query(&create_sql).execute().await
+        let client = self.connection_manager.get_client();
+        client.query(&create_sql).execute().await
             .context("Failed to create migrations table")?;
         
         Ok(())
@@ -325,7 +328,7 @@ impl SimpleMigrator {
             println!("🔍 Executing statement {}: {}", i + 1, 
                     &trimmed[..std::cmp::min(100, trimmed.len())]);
             
-            self.client.query(trimmed).execute().await
+            self.connection_manager.get_client().query(trimmed).execute().await
                 .with_context(|| format!("Failed to execute statement {}: {}", i + 1, trimmed))?;
         }
         
@@ -378,7 +381,7 @@ impl SimpleMigrator {
         
         // 首先检查迁移表是否存在
         let table_exists_query = format!("EXISTS TABLE {}", table_name);
-        let table_exists = match self.client.query(&table_exists_query).execute().await {
+        let table_exists = match self.connection_manager.get_client().query(&table_exists_query).execute().await {
             Ok(_) => true,
             Err(_) => false,
         };
@@ -409,7 +412,7 @@ impl SimpleMigrator {
         let query = format!("SELECT version FROM {} WHERE success = 1 ORDER BY version", table_name);
         
         // 尝试使用 fetch_all 方法，如果失败则回退到旧方法
-        match self.client.query(&query).fetch_all::<String>().await {
+        match self.connection_manager.get_client().query(&query).fetch_all::<String>().await {
             Ok(rows) => {
                 println!("📋 成功查询到 {} 个已应用的迁移", rows.len());
                 for version in rows {
@@ -445,7 +448,7 @@ impl SimpleMigrator {
             record.error_message.replace('\'', "''")
         );
         
-        self.client.query(&insert_sql).execute().await?;
+        self.connection_manager.get_client().query(&insert_sql).execute().await?;
         Ok(())
     }
     
@@ -469,7 +472,7 @@ impl SimpleMigrator {
         
         // 首先检查迁移表是否存在
         let table_exists_query = format!("EXISTS TABLE {}", table_name);
-        let table_exists = match self.client.query(&table_exists_query).execute().await {
+        let table_exists = match self.connection_manager.get_client().query(&table_exists_query).execute().await {
             Ok(_) => true,
             Err(_) => false,
         };
@@ -477,7 +480,7 @@ impl SimpleMigrator {
         let total_migrations = if table_exists {
             // 获取已应用的迁移数量
             let count_query = format!("SELECT count() FROM {} WHERE success = 1", table_name);
-            match self.client.query(&count_query).execute().await {
+            match self.connection_manager.get_client().query(&count_query).execute().await {
                 Ok(_) => 1, // 简化处理
                 Err(_) => 0
             }
