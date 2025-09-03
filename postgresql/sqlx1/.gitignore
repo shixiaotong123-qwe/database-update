@@ -1,0 +1,25 @@
+# Rust
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Database data
+opengauss-data/
+opengauss-logs/
+clickhouse-data/
+clickhouse-log/
+postgres-data/
+postgres-logs/
+
+# Logs
+*.log

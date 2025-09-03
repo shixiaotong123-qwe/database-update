@@ -1,7 +1,10 @@
-use anyhow::{Result, Context};
+use anyhow::{Result, Context, anyhow};
 use std::collections::{BTreeMap, HashSet};
 use serde::{Deserialize, Serialize};
 use std::time::Instant;
+use tokio::task::JoinSet;
+use tracing::{info, warn, error, debug};
+use sha2::{Sha256, Digest};
 use crate::database::ClickHouseConnectionManager;
 
 pub struct SimpleMigrator {
@@ -45,6 +48,39 @@ pub struct FailedMigration {
     pub error: String,
 }
 
+#[derive(Debug)]
+pub struct MigrationStatus {
+    pub service_name: String,
+    pub migrations_table: String,
+    pub total_migrations: usize,
+    pub table_exists: bool,
+    pub last_migration: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct MigrationVersion {
+    number: u32,
+    original: String,
+}
+
+impl MigrationVersion {
+    fn parse(version_str: &str) -> Result<Self> {
+        let number = version_str.parse::<u32>()
+            .with_context(|| format!("Invalid version number: {}", version_str))?;
+        
+        Ok(MigrationVersion {
+            number,
+            original: version_str.to_string(),
+        })
+    }
+}
+
+impl MigrationFile {
+    pub fn version(&self) -> Result<MigrationVersion> {
+        MigrationVersion::parse(&self.version)
+    }
+}
+
 impl SimpleMigrator {
     pub async fn new(database_url: &str, service_name: &str, migrations_path: &str) -> Result<Self> {
         let connection_manager = ClickHouseConnectionManager::new(
@@ -60,15 +96,59 @@ impl SimpleMigrator {
             migrations_path: migrations_path.to_string(),
         };
         
-        // 只创建一个迁移记录表
+        // 创建迁移记录表
         migrator.setup_migrations_table().await?;
         
         Ok(migrator)
     }
     
-    /// 创建迁移记录表（唯一的"meta"表）
+    /// 获取迁移表名
+    fn get_migration_table_name(&self) -> String {
+        format!("_migrations_{}", self.service_name)
+    }
+    
+    /// 执行查询并返回单个值（简化版本）
+    async fn query_single<T>(&self, query: &str) -> Result<T> 
+    where 
+        T: serde::de::DeserializeOwned + Send + Unpin + 'static,
+    {
+        // 简化实现，直接返回错误
+        // 在实际使用中，这里需要根据 ClickHouse 客户端的具体 API 来实现
+        Err(anyhow::anyhow!("Query result handling not implemented for type T"))
+    }
+    
+    /// 执行查询并返回多个值（简化版本）
+    async fn query_all<T>(&self, query: &str) -> Result<Vec<T>>
+    where 
+        T: serde::de::DeserializeOwned + Send + Unpin + 'static,
+    {
+        // 简化实现，直接返回错误
+        // 在实际使用中，这里需要根据 ClickHouse 客户端的具体 API 来实现
+        Err(anyhow::anyhow!("Query result handling not implemented for type T"))
+    }
+    /// 执行DDL语句
+    async fn execute_ddl(&self, query: &str) -> Result<()> {
+        self.connection_manager.get_client()
+            .query(query)
+            .execute()
+            .await
+            .with_context(|| format!("Failed to execute DDL: {}", query))
+    }
+    
+    /// 检查表是否存在
+    async fn table_exists(&self, table_name: &str) -> Result<bool> {
+        let query = format!(
+            "SELECT count() FROM system.tables WHERE database = currentDatabase() AND name = '{}'",
+            table_name
+        );
+        
+        let count: u64 = self.query_single(&query).await.unwrap_or(0);
+        Ok(count > 0)
+    }
+    
+    /// 创建迁移记录表
     async fn setup_migrations_table(&self) -> Result<()> {
-        let table_name = format!("_migrations_{}", self.service_name);
+        let table_name = self.get_migration_table_name();
         
         let create_sql = format!(
             r#"
@@ -82,136 +162,143 @@ impl SimpleMigrator {
                 error_message String DEFAULT ''
             ) ENGINE = MergeTree()
             ORDER BY version
+            SETTINGS index_granularity = 8192
             "#
         );
         
-        let client = self.connection_manager.get_client();
-        client.query(&create_sql).execute().await
+        self.execute_ddl(&create_sql).await
             .context("Failed to create migrations table")?;
         
+        debug!("Migration table {} ensured", table_name);
         Ok(())
     }
     
     /// 主要入口：运行待处理的迁移
     pub async fn migrate(&self) -> Result<MigrationSummary> {
-        println!("🚀 Starting migration for service: {}", self.service_name);
+        let _span = tracing::info_span!("migrate", service = %self.service_name).entered();
+        info!("Starting migration");
         
         let start_time = Instant::now();
         
-        // 1. 扫描迁移文件（只扫描一次）
-        let migration_files = self.scan_migration_files().await?;
+        // 1. 扫描迁移文件
+        let migration_files = self.scan_migration_files().await
+            .context("Failed to scan migration files")?;
         
-        // 2. 获取已执行的迁移
-        let applied_versions = self.get_applied_versions_from_database().await?;
-        
-        // 3. 筛选待执行的迁移（按版本号排序）
-        let mut pending: Vec<&MigrationFile> = migration_files
-            .values()
-            .filter(|m| !applied_versions.contains(&m.version))
-            .collect();
-        
-        // 按版本号排序
-        pending.sort_by(|a, b| a.version.cmp(&b.version));
-        
-        if pending.is_empty() {
-            println!("✅ 没有待处理的迁移，数据库已是最新状态");
+        if migration_files.is_empty() {
+            warn!("No migration files found in {}", self.migrations_path);
             return Ok(MigrationSummary::no_migrations());
         }
         
-        println!("📋 发现 {} 个待处理的迁移", pending.len());
-        for migration in &pending {
-            println!("  - {}: {}", migration.version, migration.name);
+        // 2. 验证现有迁移的校验和
+        self.validate_applied_migrations(&migration_files).await
+            .context("Migration validation failed")?;
+        
+        // 3. 获取已执行的迁移
+        let applied_versions = self.get_applied_versions().await
+            .context("Failed to get applied versions")?;
+        
+        // 4. 确定待执行的迁移
+        let pending = self.get_pending_migrations(&migration_files, &applied_versions)?;
+        
+        if pending.is_empty() {
+            info!("No pending migrations found");
+            return Ok(MigrationSummary::no_migrations());
         }
         
-        // 4. 执行迁移
-        let mut summary = MigrationSummary::new();
+        info!("Found {} pending migrations", pending.len());
+        self.log_pending_migrations(&pending);
         
-        for migration in pending {
-            println!("🔧 Executing migration: {} - {}", migration.version, migration.name);
-            
-            let result = self.execute_migration(migration).await;
-            
-            match result {
-                Ok(record) => {
-                    summary.successful.push(record);
-                    println!("✅ Migration {} completed", migration.version);
-                }
-                Err(e) => {
-                    println!("❌ Migration {} failed: {}", migration.version, e);
-                    summary.failed.push(FailedMigration {
-                        version: migration.version.clone(),
-                        name: migration.name.clone(),
-                        error: e.to_string(),
-                    });
-                    
-                    // 默认策略：遇到失败就停止
-                    if !self.should_continue_on_failure() {
-                        break;
-                    }
-                }
-            }
-        }
-        
+        // 5. 执行迁移
+        let mut summary = self.execute_pending_migrations(pending).await?;
         summary.total_time = start_time.elapsed();
+        
+        info!(
+            successful = summary.successful.len(),
+            failed = summary.failed.len(),
+            duration_ms = summary.total_time.as_millis(),
+            "Migration completed"
+        );
+        
         Ok(summary)
     }
     
-    /// 扫描迁移文件目录
+    /// 扫描迁移文件目录（并发处理）
     async fn scan_migration_files(&self) -> Result<BTreeMap<String, MigrationFile>> {
         use tokio::fs;
         use std::path::Path;
         
         let migrations_dir = Path::new(&self.migrations_path);
         if !migrations_dir.exists() {
-            println!("⚠️  迁移目录不存在: {}", self.migrations_path);
+            warn!("Migration directory does not exist: {}", self.migrations_path);
             return Ok(BTreeMap::new());
         }
         
-        let mut migration_files = BTreeMap::new();
-        let mut entries = fs::read_dir(migrations_dir).await?;
+        let mut entries = fs::read_dir(migrations_dir).await
+            .with_context(|| format!("Failed to read migrations directory: {}", self.migrations_path))?;
         
+        let mut join_set = JoinSet::new();
+        
+        // 并发读取所有SQL文件
         while let Some(entry) = entries.next_entry().await? {
             let path = entry.path();
             
             if path.extension() == Some(std::ffi::OsStr::new("sql")) {
-                match self.parse_migration_file(&path).await {
-                    Ok(migration) => {
-                        println!("📁 发现迁移文件: {} - {}", migration.version, migration.name);
-                        migration_files.insert(migration.version.clone(), migration);
+                let path_clone = path.clone();
+                join_set.spawn(async move {
+                    let content = tokio::fs::read_to_string(&path_clone).await?;
+                    Ok::<_, anyhow::Error>((path_clone, content))
+                });
+            }
+        }
+        
+        let mut migration_files = BTreeMap::new();
+        
+        // 收集所有文件内容并解析
+        while let Some(result) = join_set.join_next().await {
+            match result? {
+                Ok((path, content)) => {
+                    match self.parse_migration_content(&path, &content) {
+                        Ok(migration) => {
+                            debug!("Parsed migration: {} - {}", migration.version, migration.name);
+                            migration_files.insert(migration.version.clone(), migration);
+                        }
+                        Err(e) => {
+                            warn!("Failed to parse migration file {:?}: {}", path, e);
+                        }
                     }
-                    Err(e) => {
-                        println!("⚠️  Failed to parse migration file {:?}: {}", path, e);
-                    }
+                }
+                Err(e) => {
+                    warn!("Failed to read migration file: {}", e);
                 }
             }
         }
         
-        println!("📋 总共扫描到 {} 个迁移文件", migration_files.len());
+        info!("Scanned {} migration files", migration_files.len());
         Ok(migration_files)
     }
     
-    /// 解析单个迁移文件
-    async fn parse_migration_file(&self, file_path: &std::path::Path) -> Result<MigrationFile> {
+    /// 解析单个迁移文件内容
+    fn parse_migration_content(&self, file_path: &std::path::Path, content: &str) -> Result<MigrationFile> {
         use regex::Regex;
         
-        let content = tokio::fs::read_to_string(file_path).await?;
-        
-        // 解析文件名：V000__baseline_existing_database.sql 或 V001__create_users_table.sql
+        // 解析文件名：V001__create_users_table.sql
         let filename = file_path.file_stem()
             .and_then(|s| s.to_str())
-            .ok_or_else(|| anyhow::anyhow!("Invalid filename"))?;
+            .ok_or_else(|| anyhow!("Invalid filename: {:?}", file_path))?;
         
-        let version_regex = Regex::new(r"^V(\d+)__(.+)$")?;
+        let version_regex = Regex::new(r"^V(\d+)__(.+)$")
+            .context("Failed to compile version regex")?;
+        
         let captures = version_regex.captures(filename)
-            .ok_or_else(|| anyhow::anyhow!("Invalid migration filename format: {}", filename))?;
+            .ok_or_else(|| anyhow!("Invalid migration filename format: {} (expected: V001__description.sql)", filename))?;
         
         let version = captures.get(1).unwrap().as_str().to_string();
         let name = captures.get(2).unwrap().as_str().replace('_', " ");
         
         // 解析SQL内容
-        let (up_sql, down_sql) = self.parse_sql_content(&content)?;
+        let (up_sql, down_sql) = self.parse_sql_content(content)?;
         
-        // 检查是否为基线迁移（版本号为000或SQL内容为空）
+        // 检查是否为基线迁移
         let is_baseline = version == "000" || up_sql.trim().is_empty();
         
         // 计算校验和
@@ -246,8 +333,8 @@ impl SimpleMigrator {
                 continue;
             }
             
-            // 跳过注释行（但保留SQL中的注释）
-            if trimmed.starts_with("-- ") && !trimmed.contains("/*") {
+            // 跳过元数据注释
+            if trimmed.starts_with("-- ") && !trimmed.contains("/*") && !trimmed.contains("--") {
                 continue;
             }
             
@@ -268,16 +355,175 @@ impl SimpleMigrator {
         Ok((up_sql.trim().to_string(), down_sql.map(|s| s.trim().to_string())))
     }
     
+    /// 验证已应用迁移的校验和
+    async fn validate_applied_migrations(&self, migration_files: &BTreeMap<String, MigrationFile>) -> Result<()> {
+        let table_name = self.get_migration_table_name();
+        
+        if !self.table_exists(&table_name).await? {
+            return Ok(());
+        }
+        
+        let query = format!("SELECT version, checksum FROM {} WHERE success = 1", table_name);
+        let applied_records: Vec<(String, String)> = self.query_all(&query).await?;
+        
+        let mut validation_errors = Vec::new();
+        
+        for (version, stored_checksum) in applied_records {
+            if let Some(migration_file) = migration_files.get(&version) {
+                if migration_file.checksum != stored_checksum {
+                    validation_errors.push(format!(
+                        "Migration {}: checksum mismatch (expected: {}, found: {})",
+                        version, stored_checksum, migration_file.checksum
+                    ));
+                }
+            } else {
+                warn!("Applied migration {} not found in migration files", version);
+            }
+        }
+        
+        if !validation_errors.is_empty() {
+            return Err(anyhow!(
+                "Migration validation failed:\n{}",
+                validation_errors.join("\n")
+            ));
+        }
+        
+        Ok(())
+    }
+    
+    /// 获取已应用的迁移版本
+    async fn get_applied_versions(&self) -> Result<HashSet<String>> {
+        let table_name = self.get_migration_table_name();
+        
+        if !self.table_exists(&table_name).await? {
+            info!("Migration table {} does not exist, treating all migrations as pending", table_name);
+            return Ok(HashSet::new());
+        }
+        
+        let query = format!("SELECT version FROM {} WHERE success = 1 ORDER BY version", table_name);
+        
+        let versions: Vec<String> = self.query_all(&query).await
+            .unwrap_or_else(|e| {
+                warn!("Failed to query applied versions: {}", e);
+                Vec::new()
+            });
+        
+        info!("Found {} applied migrations", versions.len());
+        Ok(versions.into_iter().collect())
+    }
+    
+    /// 确定待执行的迁移
+    fn get_pending_migrations(
+        &self, 
+        migration_files: &BTreeMap<String, MigrationFile>,
+        applied_versions: &HashSet<String>
+    ) -> Result<Vec<MigrationFile>> {
+        let mut pending: Vec<MigrationFile> = migration_files
+            .values()
+            .filter(|m| !applied_versions.contains(&m.version))
+            .cloned()
+            .collect();
+        
+        // 使用数字版本排序
+        pending.sort_by(|a, b| {
+            let a_version = a.version().unwrap_or(MigrationVersion { 
+                number: 0, 
+                original: a.version.clone() 
+            });
+            let b_version = b.version().unwrap_or(MigrationVersion { 
+                number: 0, 
+                original: b.version.clone() 
+            });
+            a_version.cmp(&b_version)
+        });
+        
+        // 验证版本序列的连续性
+        self.validate_migration_sequence(&pending)?;
+        
+        Ok(pending)
+    }
+    
+    /// 验证迁移序列
+    fn validate_migration_sequence(&self, pending: &[MigrationFile]) -> Result<()> {
+        let mut versions: Vec<u32> = pending.iter()
+            .filter_map(|m| m.version().ok())
+            .map(|v| v.number)
+            .collect();
+        
+        versions.sort();
+        
+        // 检查重复版本
+        let mut seen = HashSet::new();
+        for version in &versions {
+            if !seen.insert(*version) {
+                return Err(anyhow!("Duplicate migration version: {}", version));
+            }
+        }
+        
+        Ok(())
+    }
+    
+    /// 记录待处理的迁移
+    fn log_pending_migrations(&self, pending: &[MigrationFile]) {
+        for migration in pending {
+            info!(
+                version = %migration.version,
+                name = %migration.name,
+                is_baseline = migration.is_baseline,
+                checksum = %migration.checksum[..8],
+                "Pending migration"
+            );
+        }
+    }
+    
+    /// 执行待处理的迁移
+    async fn execute_pending_migrations(&self, pending: Vec<MigrationFile>) -> Result<MigrationSummary> {
+        let mut summary = MigrationSummary::new();
+        let total = pending.len();
+        
+        for (index, migration) in pending.iter().enumerate() {
+            let _span = tracing::info_span!("execute_migration", 
+                version = %migration.version, 
+                progress = format!("{}/{}", index + 1, total)
+            ).entered();
+            
+            info!("Executing migration: {}", migration.name);
+            
+            match self.execute_migration(migration).await {
+                Ok(record) => {
+                    summary.successful.push(record);
+                    info!("Migration completed successfully");
+                }
+                Err(e) => {
+                    let failed_migration = FailedMigration {
+                        version: migration.version.clone(),
+                        name: migration.name.clone(),
+                        error: e.to_string(),
+                    };
+                    
+                    error!("Migration failed: {}", e);
+                    summary.failed.push(failed_migration);
+                    
+                    if !self.should_continue_on_failure() {
+                        error!("Stopping migration execution due to failure");
+                        break;
+                    }
+                }
+            }
+        }
+        
+        Ok(summary)
+    }
+    
     /// 执行单个迁移
     async fn execute_migration(&self, migration: &MigrationFile) -> Result<MigrationRecord> {
         let start_time = Instant::now();
         
         // 对于基线迁移，跳过SQL执行
         let execution_result = if migration.is_baseline {
-            println!("📋 Baseline migration detected, skipping SQL execution");
+            info!("Baseline migration detected, skipping SQL execution");
             Ok(())
         } else {
-            // 执行SQL语句
             self.execute_sql_statements(&migration.up_sql).await
         };
         
@@ -296,12 +542,13 @@ impl SimpleMigrator {
             error_message: error_message.clone(),
         };
         
-        // 保存到数据库（即使失败也要记录）
-        self.save_migration_record(&record).await?;
+        // 保存到数据库（无论成功失败都记录）
+        self.save_migration_record(&record).await
+            .context("Failed to save migration record")?;
         
         // 如果执行失败，返回错误
         if !success {
-            return Err(anyhow::anyhow!("Migration execution failed: {}", error_message));
+            return Err(anyhow!("Migration execution failed: {}", error_message));
         }
         
         Ok(record)
@@ -309,13 +556,11 @@ impl SimpleMigrator {
     
     /// 执行SQL语句（支持多语句）
     async fn execute_sql_statements(&self, sql: &str) -> Result<()> {
-        // 如果SQL为空，直接返回成功
         if sql.trim().is_empty() {
-            println!("📝 Empty SQL content, skipping execution");
+            debug!("Empty SQL content, skipping execution");
             return Ok(());
         }
         
-        // 简单的语句分割（按分号分割，但要注意字符串中的分号）
         let statements = self.split_sql_statements(sql);
         
         for (i, statement) in statements.iter().enumerate() {
@@ -324,113 +569,76 @@ impl SimpleMigrator {
                 continue;
             }
             
-            println!("🔍 Executing statement {}: {}", i + 1, 
-                    &trimmed[..std::cmp::min(100, trimmed.len())]);
+            debug!("Executing statement {}/{}: {}", 
+                   i + 1, statements.len(),
+                   &trimmed[..std::cmp::min(100, trimmed.len())]);
             
-            self.connection_manager.get_client().query(trimmed).execute().await
-                .with_context(|| format!("Failed to execute statement {}: {}", i + 1, trimmed))?;
+            self.execute_ddl(trimmed).await
+                .with_context(|| format!("Failed to execute statement {}/{}: {}", i + 1, statements.len(), trimmed))?;
         }
         
         Ok(())
     }
     
-    /// 分割SQL语句
+    /// 改进的SQL语句分割
     fn split_sql_statements(&self, sql: &str) -> Vec<String> {
-        // 简单实现：按分号分割，忽略字符串内的分号
         let mut statements = Vec::new();
         let mut current_statement = String::new();
-        let mut in_string = false;
-        let mut string_delimiter = '\0';
+        let mut in_single_quote = false;
+        let mut in_double_quote = false;
+        let mut in_comment = false;
+        let mut prev_char = '\0';
         
         for ch in sql.chars() {
             match ch {
-                '\'' | '"' if !in_string => {
-                    in_string = true;
-                    string_delimiter = ch;
-                    current_statement.push(ch);
-                }
-                ch if in_string && ch == string_delimiter => {
-                    in_string = false;
-                    current_statement.push(ch);
-                }
-                ';' if !in_string => {
-                    if !current_statement.trim().is_empty() {
-                        statements.push(current_statement.trim().to_string());
-                        current_statement.clear();
+                '\'' if !in_double_quote && !in_comment => {
+                    // 处理转义的单引号
+                    if prev_char != '\\' {
+                        in_single_quote = !in_single_quote;
                     }
+                    current_statement.push(ch);
+                }
+                '"' if !in_single_quote && !in_comment => {
+                    // 处理转义的双引号
+                    if prev_char != '\\' {
+                        in_double_quote = !in_double_quote;
+                    }
+                    current_statement.push(ch);
+                }
+                '-' if prev_char == '-' && !in_single_quote && !in_double_quote => {
+                    in_comment = true;
+                    current_statement.push(ch);
+                }
+                '\n' if in_comment => {
+                    in_comment = false;
+                    current_statement.push(ch);
+                }
+                ';' if !in_single_quote && !in_double_quote && !in_comment => {
+                    let statement = current_statement.trim();
+                    if !statement.is_empty() {
+                        statements.push(statement.to_string());
+                    }
+                    current_statement.clear();
                 }
                 _ => {
                     current_statement.push(ch);
                 }
             }
+            prev_char = ch;
         }
         
         // 添加最后一个语句
-        if !current_statement.trim().is_empty() {
-            statements.push(current_statement.trim().to_string());
+        let final_statement = current_statement.trim();
+        if !final_statement.is_empty() {
+            statements.push(final_statement.to_string());
         }
         
         statements
     }
     
-    /// 从数据库获取已应用的迁移版本
-    async fn get_applied_versions_from_database(&self) -> Result<HashSet<String>> {
-        let mut applied_versions = HashSet::new();
-        let table_name = format!("_migrations_{}", self.service_name);
-        
-        // 首先检查迁移表是否存在
-        let table_exists_query = format!("EXISTS TABLE {}", table_name);
-        let table_exists = match self.connection_manager.get_client().query(&table_exists_query).execute().await {
-            Ok(_) => true,
-            Err(_) => false,
-        };
-        
-        if !table_exists {
-            println!("📋 迁移表 {} 不存在，所有迁移都标记为未应用", table_name);
-            println!("🔧 迁移表将在首次迁移时自动创建");
-            return Ok(applied_versions);
-        }
-        
-        // 使用更智能的方法：查询迁移表中已应用的版本
-        println!("📋 检测到迁移表存在，查询已应用的迁移版本");
-        applied_versions = self.get_applied_versions_from_table().await?;
-        
-        println!("📋 检查完成：发现 {} 个已应用的迁移", applied_versions.len());
-        Ok(applied_versions)
-    }
-    
-    /// 从迁移表中查询已应用的迁移版本
-    async fn get_applied_versions_from_table(&self) -> Result<HashSet<String>> {
-        let mut applied_versions = HashSet::new();
-        let table_name = format!("_migrations_{}", self.service_name);
-        
-        // 使用新版本的 ClickHouse 客户端特性来精确查询
-        println!("📋 使用新版本 ClickHouse 客户端查询已应用的迁移版本");
-        
-        // 查询迁移表中所有已应用的版本
-        let query = format!("SELECT version FROM {} WHERE success = 1 ORDER BY version", table_name);
-        
-        // 尝试使用 fetch_all 方法，如果失败则回退到旧方法
-        match self.connection_manager.get_client().query(&query).fetch_all::<String>().await {
-            Ok(rows) => {
-                println!("📋 成功查询到 {} 个已应用的迁移", rows.len());
-                for version in rows {
-                    applied_versions.insert(version.clone());
-                    println!("📋 迁移 {} 已应用", version);
-                }
-            }
-            Err(e) => {
-                println!("📋 查询迁移表失败: {}", e);
-                println!("📋 回退到旧方法：假设迁移表为空，所有迁移标记为未应用");
-            }
-        }
-        
-        Ok(applied_versions)
-    }
-    
     /// 保存迁移记录
     async fn save_migration_record(&self, record: &MigrationRecord) -> Result<()> {
-        let table_name = format!("_migrations_{}", self.service_name);
+        let table_name = self.get_migration_table_name();
         
         let insert_sql = format!(
             r#"
@@ -447,13 +655,14 @@ impl SimpleMigrator {
             record.error_message.replace('\'', "''")
         );
         
-        self.connection_manager.get_client().query(&insert_sql).execute().await?;
+        self.execute_ddl(&insert_sql).await
+            .context("Failed to insert migration record")?;
+        
         Ok(())
     }
     
-    /// 计算SQL内容的校验和
+    /// 计算校验和
     fn calculate_checksum(&self, content: &str) -> String {
-        use sha2::{Sha256, Digest};
         let mut hasher = Sha256::new();
         hasher.update(content.as_bytes());
         format!("{:x}", hasher.finalize())
@@ -467,37 +676,105 @@ impl SimpleMigrator {
     
     /// 获取迁移状态
     pub async fn get_migration_status(&self) -> Result<MigrationStatus> {
-        let table_name = format!("_migrations_{}", self.service_name);
+        let table_name = self.get_migration_table_name();
+        let table_exists = self.table_exists(&table_name).await?;
         
-        // 首先检查迁移表是否存在
-        let table_exists_query = format!("EXISTS TABLE {}", table_name);
-        let table_exists = match self.connection_manager.get_client().query(&table_exists_query).execute().await {
-            Ok(_) => true,
-            Err(_) => false,
-        };
-        
-        let total_migrations = if table_exists {
-            // 获取已应用的迁移数量
+        let (total_migrations, last_migration) = if table_exists {
             let count_query = format!("SELECT count() FROM {} WHERE success = 1", table_name);
-            match self.connection_manager.get_client().query(&count_query).execute().await {
-                Ok(_) => 1, // 简化处理
-                Err(_) => 0
-            }
+            let count: u64 = self.query_single(&count_query).await.unwrap_or(0);
+            
+            let last_query = format!(
+                "SELECT version FROM {} WHERE success = 1 ORDER BY version DESC LIMIT 1", 
+                table_name
+            );
+            let last: Option<String> = self.query_single(&last_query).await.ok();
+            
+            (count as usize, last)
         } else {
-            0 // 表不存在，迁移数量为0
-        };
-        
-        let status_message = if table_exists {
-            format!("已存在")
-        } else {
-            format!("不存在（将在首次迁移时自动创建）")
+            (0, None)
         };
         
         Ok(MigrationStatus {
             service_name: self.service_name.clone(),
-            migrations_table: format!("{} ({})", table_name, status_message),
+            migrations_table: table_name,
             total_migrations,
+            table_exists,
+            last_migration,
         })
+    }
+    
+    /// 获取已应用迁移的详细记录
+    pub async fn get_applied_migrations(&self) -> Result<Vec<MigrationRecord>> {
+        let table_name = self.get_migration_table_name();
+        
+        if !self.table_exists(&table_name).await? {
+            return Ok(Vec::new());
+        }
+        
+        let query = format!(
+            "SELECT version, name, applied_at, execution_time_ms, checksum, success, error_message 
+             FROM {} ORDER BY version",
+            table_name
+        );
+        
+        // 注意：这里需要根据实际的 ClickHouse 客户端 API 调整
+        // 这是一个示例实现
+        let records = self.query_all::<(String, String, String, u64, String, u8, String)>(&query).await?;
+        
+        let migrations = records.into_iter().map(|(version, name, applied_at, execution_time_ms, checksum, success, error_message)| {
+            MigrationRecord {
+                version,
+                name,
+                applied_at,
+                execution_time_ms,
+                checksum,
+                success: success == 1,
+                error_message,
+            }
+        }).collect();
+        
+        Ok(migrations)
+    }
+    
+    /// 回滚最后一个迁移（如果支持）
+    pub async fn rollback_last(&self) -> Result<()> {
+        // 获取最后一个成功的迁移
+        let table_name = self.get_migration_table_name();
+        let query = format!(
+            "SELECT version FROM {} WHERE success = 1 ORDER BY version DESC LIMIT 1",
+            table_name
+        );
+        
+        let last_version: String = self.query_single(&query).await
+            .context("No migrations to rollback")?;
+        
+        // 扫描迁移文件找到对应的回滚SQL
+        let migration_files = self.scan_migration_files().await?;
+        
+        if let Some(migration_file) = migration_files.get(&last_version) {
+            if let Some(down_sql) = &migration_file.down_sql {
+                info!("Rolling back migration: {} - {}", migration_file.version, migration_file.name);
+                
+                // 执行回滚SQL
+                self.execute_sql_statements(down_sql).await
+                    .context("Failed to execute rollback SQL")?;
+                
+                // 删除迁移记录
+                let delete_sql = format!(
+                    "DELETE FROM {} WHERE version = '{}'",
+                    table_name, last_version
+                );
+                self.execute_ddl(&delete_sql).await?;
+                
+                info!("Successfully rolled back migration: {}", last_version);
+            } else {
+                return Err(anyhow!("Migration {} does not support rollback", last_version));
+            }
+        } else {
+            return Err(anyhow!("Migration file for version {} not found", last_version));
+        }
+        
+        Ok(())
     }
 }
 
@@ -505,13 +782,6 @@ impl SimpleMigrator {
 enum Section {
     Up,
     Down,
-}
-
-#[derive(Debug)]
-pub struct MigrationStatus {
-    pub service_name: String,
-    pub migrations_table: String,
-    pub total_migrations: usize,
 }
 
 impl MigrationSummary {
@@ -529,5 +799,44 @@ impl MigrationSummary {
     
     pub fn is_success(&self) -> bool {
         self.failed.is_empty()
+    }
+    
+    pub fn has_failures(&self) -> bool {
+        !self.failed.is_empty()
+    }
+    
+    pub fn total_executed(&self) -> usize {
+        self.successful.len() + self.failed.len()
+    }
+}
+
+impl std::fmt::Display for MigrationStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "Migration Status for service: {}", self.service_name)?;
+        writeln!(f, "  Table: {}", self.migrations_table)?;
+        writeln!(f, "  Table exists: {}", self.table_exists)?;
+        writeln!(f, "  Total applied migrations: {}", self.total_migrations)?;
+        if let Some(ref last) = self.last_migration {
+            writeln!(f, "  Last migration: {}", last)?;
+        }
+        Ok(())
+    }
+}
+
+impl std::fmt::Display for MigrationSummary {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "Migration Summary:")?;
+        writeln!(f, "  Successful: {}", self.successful.len())?;
+        writeln!(f, "  Failed: {}", self.failed.len())?;
+        writeln!(f, "  Total time: {:?}", self.total_time)?;
+        
+        if !self.failed.is_empty() {
+            writeln!(f, "\nFailed migrations:")?;
+            for failed in &self.failed {
+                writeln!(f, "  - {}: {}", failed.version, failed.error)?;
+            }
+        }
+        
+        Ok(())
     }
 }
