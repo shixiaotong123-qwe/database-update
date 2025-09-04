@@ -121,13 +121,20 @@ impl DatabaseManager {
     pub fn safe_migrate(&self) -> Result<()> {
         info!("开始执行数据库迁移...");
         
+        // 首先检查并设置数据库基线
+        self.check_and_setup_database()?;
+        
         let mut conn = self.pool.get().context("无法获取数据库连接")?;
         
         match conn.run_pending_migrations(MIGRATIONS) {
             Ok(migrations) => {
-                info!("✅ 数据库迁移完成，执行了 {} 个迁移", migrations.len());
-                for migration in migrations {
-                    info!("  - {}", migration);
+                if migrations.is_empty() {
+                    info!("✅ 数据库已是最新状态，无需执行迁移");
+                } else {
+                    info!("✅ 数据库迁移完成，执行了 {} 个迁移", migrations.len());
+                    for migration in migrations {
+                        info!("  - {}", migration);
+                    }
                 }
                 Ok(())
             }
