@@ -1,3 +1,4 @@
+// 增强版 database.rs - 集成了完整的错误处理机制
 use anyhow::{Context, Result};
 use tokio_postgres::{Client, NoTls};
 use tracing::{info, warn, error};
@@ -8,7 +9,7 @@ mod embedded {
     embed_migrations!("migrations");
 }
 
-/// 数据库管理器，基于Refinery实现
+/// 数据库管理器，基于Refinery实现，集成完整错误处理
 pub struct DatabaseManager {
     pub client: Client,
 }
@@ -39,7 +40,7 @@ impl DatabaseManager {
         Ok(Self { client })
     }
 
-    /// 执行安全迁移
+    /// 执行安全迁移 - 增强版，集成完整错误处理
     pub async fn safe_migrate(&mut self, database_url: &str) -> Result<()> {
         info!("开始执行Refinery数据库迁移...");
         
@@ -65,19 +66,77 @@ impl DatabaseManager {
             
             Ok(report)
         }).await
-        .context("迁移任务执行失败")?
-        .context("迁移操作失败")?;
+        .context("迁移任务执行失败");
         
-        // 处理迁移结果
-        info!("✅ Refinery数据库迁移完成");
-        info!("已应用的迁移数量: {}", migration_result.applied_migrations().len());
+        // 🆕 增强的错误处理 - 根据结果决定处理方式
+        match migration_result {
+            Ok(Ok(report)) => {
+                // 处理成功结果
+                info!("✅ Refinery数据库迁移完成");
+                info!("已应用的迁移数量: {}", report.applied_migrations().len());
+                
+                for migration in report.applied_migrations() {
+                    info!("  ✅ {}: {}", migration.version(), migration.name());
+                }
+                
+                self.print_migration_status().await?;
+                Ok(())
+            }
+            Ok(Err(migration_error)) => {
+                // 🚨 迁移执行出错 - 触发完整的错误处理流程
+                error!("❌ 迁移执行失败，启动错误处理流程...");
+                error!("错误详情: {}", migration_error);
+                
+                // 执行错误处理流程
+                if let Err(handle_err) = self.handle_migration_failure().await {
+                    error!("⚠️  错误处理器本身发生错误: {}", handle_err);
+                }
+                
+                Err(anyhow::anyhow!("迁移执行失败: {}", migration_error))
+            }
+            Err(task_error) => {
+                // 🚨 异步任务执行出错
+                error!("❌ 迁移任务执行失败，启动错误处理流程...");
+                error!("任务错误详情: {}", task_error);
+                
+                // 执行错误处理流程
+                if let Err(handle_err) = self.handle_migration_failure().await {
+                    error!("⚠️  错误处理器本身发生错误: {}", handle_err);
+                }
+                
+                Err(task_error)
+            }
+        }
+    }
+    
+    /// 带重试机制的安全迁移
+    pub async fn safe_migrate_with_retry(&mut self, database_url: &str, max_retries: u32) -> Result<()> {
+        let mut attempts = 0;
         
-        for migration in migration_result.applied_migrations() {
-            info!("  ✅ {}: {}", migration.version(), migration.name());
+        while attempts < max_retries {
+            match self.safe_migrate(database_url).await {
+                Ok(_) => {
+                    if attempts > 0 {
+                        info!("✅ 迁移在第 {} 次尝试后成功", attempts + 1);
+                    }
+                    return Ok(());
+                }
+                Err(e) => {
+                    attempts += 1;
+                    if attempts < max_retries {
+                        let delay_seconds = 5 * attempts as u64;
+                        warn!("⚠️  迁移失败，第 {} 次重试 (最大 {} 次)，{}秒后重试: {}", 
+                              attempts, max_retries, delay_seconds, e);
+                        tokio::time::sleep(tokio::time::Duration::from_secs(delay_seconds)).await;
+                    } else {
+                        error!("❌ 迁移在 {} 次尝试后仍然失败", max_retries);
+                        return Err(e);
+                    }
+                }
+            }
         }
         
-        self.print_migration_status().await?;
-        Ok(())
+        unreachable!()
     }
     
     /// 检查是否为现有数据库
@@ -110,30 +169,44 @@ impl DatabaseManager {
         Ok(())
     }
     
-    /// 处理迁移失败
+    /// 🆕 处理迁移失败 - 现在被实际调用
     async fn handle_migration_failure(&self) -> Result<()> {
-        error!("正在处理Refinery迁移失败...");
+        error!("🚨 正在处理Refinery迁移失败...");
         
-        // 生成失败报告
-        self.generate_failure_report().await?;
+        // 生成详细的失败报告
+        info!("📊 生成失败分析报告...");
+        if let Err(e) = self.generate_failure_report().await {
+            error!("生成失败报告时出错: {}", e);
+        }
         
         // 检查数据完整性
-        self.check_data_integrity().await?;
+        info!("🔍 检查数据完整性...");
+        if let Err(e) = self.check_data_integrity().await {
+            error!("数据完整性检查时出错: {}", e);
+        }
+        
+        // 生成恢复建议
+        self.generate_recovery_suggestions().await?;
         
         Ok(())
     }
     
-    /// 生成失败报告
+    /// 🆕 生成失败报告 - 增强版
     async fn generate_failure_report(&self) -> Result<()> {
         let report_time = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC");
         
+        error!("╔════════════════════════════════════════╗");
+        error!("║        Refinery 迁移失败报告            ║");
+        error!("╚════════════════════════════════════════╝");
+        error!("📅 失败时间: {}", report_time);
+        
         // 检查是否存在Refinery迁移历史表
-        let rows = self.client.query(
+        let history_exists = !self.client.query(
             "SELECT 1 FROM information_schema.tables WHERE table_name = 'refinery_schema_history'",
             &[]
-        ).await?;
+        ).await?.is_empty();
         
-        if !rows.is_empty() {
+        if history_exists {
             let migration_history = self.client.query(
                 "SELECT version, name, applied_on, checksum 
                  FROM refinery_schema_history 
@@ -141,59 +214,133 @@ impl DatabaseManager {
                 &[]
             ).await?;
             
-            error!("=== Refinery迁移失败报告 ===");
-            error!("时间: {}", report_time);
-            error!("迁移历史记录数量: {}", migration_history.len());
+            error!("📊 迁移历史记录数量: {}", migration_history.len());
+            error!("📋 最近的迁移记录:");
             
-            for row in migration_history.iter().take(5) { // 只显示最近5个
+            for (i, row) in migration_history.iter().take(5).enumerate() {
                 let version: i32 = row.get("version");
                 let name: String = row.get("name");
-                let applied_on: chrono::DateTime<chrono::Utc> = row.get("applied_on");
-                error!("  - v{}: {} ({})", version, name, applied_on.format("%Y-%m-%d %H:%M:%S"));
+                let applied_on: String = row.get("applied_on");
+                let checksum: String = row.get("checksum");
+                
+                error!("  {}. V{:03}: {} ({})", 
+                      i + 1, version, name, applied_on);
+                error!("     校验和: {}", &checksum[..8]);
             }
         } else {
-            error!("Refinery迁移历史表不存在，可能是首次迁移失败");
+            error!("⚠️  Refinery迁移历史表不存在，这可能是首次迁移失败");
+            error!("   或者数据库连接配置有问题");
         }
+        
+        // 检查文件系统中的迁移文件
+        info!("📁 检查文件系统中的迁移文件...");
+        // 注意：在实际环境中，这里需要实际读取文件系统
+        error!("💾 文件系统状态将需要手动检查");
+        
+        error!("╚════════════════════════════════════════╝");
         
         Ok(())
     }
     
-    /// 检查数据完整性
+    /// 🆕 检查数据完整性 - 增强版
     async fn check_data_integrity(&self) -> Result<()> {
-        info!("检查数据完整性...");
+        info!("🔍 开始数据完整性检查...");
         
-        let critical_tables = vec!["users", "products", "orders"];
+        let critical_tables = vec![
+            ("users", "用户表"),
+            ("products", "产品表"), 
+            ("orders", "订单表"),
+            ("refinery_schema_history", "迁移历史表")
+        ];
         
-        for table in critical_tables {
-            let rows = self.client.query(
+        let mut integrity_issues = Vec::new();
+        
+        for (table, description) in critical_tables {
+            info!("   检查 {} ({})...", table, description);
+            
+            // 检查表是否存在
+            let exists_result = self.client.query(
                 "SELECT EXISTS (
                     SELECT FROM information_schema.tables 
                     WHERE table_name = $1 AND table_schema = 'public'
                 ) as exists",
                 &[&table]
-            ).await?;
+            ).await;
             
-            let exists: bool = rows[0].get("exists");
-            
-            if exists {
-                let count_rows = self.client.query(
-                    &format!("SELECT COUNT(*) as count FROM {}", table),
-                    &[]
-                ).await;
-                
-                match count_rows {
-                    Ok(rows) => {
-                        let count: i64 = rows[0].get("count");
-                        info!("✅ 表 {} 存在，包含 {} 行数据", table, count);
-                    }
-                    Err(e) => {
-                        warn!("⚠️  无法查询表 {} 的数据量: {}", table, e);
+            match exists_result {
+                Ok(rows) => {
+                    let exists: bool = rows[0].get("exists");
+                    
+                    if exists {
+                        // 检查表的数据量和基本结构
+                        match self.check_table_details(table).await {
+                            Ok(count) => {
+                                info!("   ✅ {} 正常，包含 {} 行数据", description, count);
+                            }
+                            Err(e) => {
+                                let issue = format!("表 {} 存在但查询失败: {}", table, e);
+                                warn!("   ⚠️  {}", issue);
+                                integrity_issues.push(issue);
+                            }
+                        }
+                    } else {
+                        let issue = format!("关键表 {} ({}) 不存在", table, description);
+                        warn!("   ❌ {}", issue);
+                        integrity_issues.push(issue);
                     }
                 }
-            } else {
-                warn!("⚠️  关键表 {} 不存在", table);
+                Err(e) => {
+                    let issue = format!("无法检查表 {} 的存在性: {}", table, e);
+                    error!("   💥 {}", issue);
+                    integrity_issues.push(issue);
+                }
             }
         }
+        
+        // 汇总完整性检查结果
+        if integrity_issues.is_empty() {
+            info!("✅ 数据完整性检查通过，所有关键表都正常");
+        } else {
+            error!("❌ 发现 {} 个数据完整性问题:", integrity_issues.len());
+            for (i, issue) in integrity_issues.iter().enumerate() {
+                error!("   {}. {}", i + 1, issue);
+            }
+        }
+        
+        Ok(())
+    }
+    
+    /// 检查单个表的详细信息
+    async fn check_table_details(&self, table_name: &str) -> Result<i64> {
+        let rows = self.client.query(
+            &format!("SELECT COUNT(*) as count FROM {}", table_name),
+            &[]
+        ).await?;
+        
+        let count: i64 = rows[0].get("count");
+        Ok(count)
+    }
+    
+    /// 🆕 生成恢复建议
+    async fn generate_recovery_suggestions(&self) -> Result<()> {
+        error!("╔════════════════════════════════════════╗");
+        error!("║           恢复建议和后续步骤            ║");
+        error!("╚════════════════════════════════════════╝");
+        error!("");
+        error!("🔧 建议的恢复步骤:");
+        error!("   1. 检查错误日志以确定具体的失败原因");
+        error!("   2. 验证数据库连接和权限设置");
+        error!("   3. 检查迁移文件的SQL语法");
+        error!("   4. 考虑从最近的备份恢复（如果有）");
+        error!("   5. 手动修复数据库状态后重新运行迁移");
+        error!("");
+        error!("🚨 立即行动项:");
+        error!("   • 不要删除任何数据");
+        error!("   • 创建当前数据库状态的备份");
+        error!("   • 联系数据库管理员（如果适用）");
+        error!("");
+        error!("📞 如需帮助，请查阅 Refinery 使用指南或联系技术支持");
+        error!("╚════════════════════════════════════════╝");
         
         Ok(())
     }
@@ -244,4 +391,39 @@ pub async fn connect() -> Result<DatabaseManager> {
         .unwrap_or_else(|_| "postgresql://sxt:default@localhost:5432/postgres".to_string());
     
     DatabaseManager::new_with_config(&database_url).await
+}
+
+/// 🆕 增强的连接函数，支持重试
+pub async fn connect_with_retry(max_retries: u32) -> Result<DatabaseManager> {
+    dotenv::dotenv().ok();
+    
+    let database_url = std::env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "postgresql://sxt:default@localhost:5432/postgres".to_string());
+    
+    let mut attempts = 0;
+    
+    while attempts < max_retries {
+        match DatabaseManager::new_with_config(&database_url).await {
+            Ok(manager) => {
+                if attempts > 0 {
+                    info!("✅ 数据库连接在第 {} 次尝试后成功", attempts + 1);
+                }
+                return Ok(manager);
+            }
+            Err(e) => {
+                attempts += 1;
+                if attempts < max_retries {
+                    let delay_seconds = 3 * attempts as u64;
+                    warn!("⚠️  数据库连接失败，第 {} 次重试 (最大 {} 次)，{}秒后重试: {}", 
+                          attempts, max_retries, delay_seconds, e);
+                    tokio::time::sleep(tokio::time::Duration::from_secs(delay_seconds)).await;
+                } else {
+                    error!("❌ 数据库连接在 {} 次尝试后仍然失败: {}", max_retries, e);
+                    return Err(e);
+                }
+            }
+        }
+    }
+    
+    unreachable!()
 }

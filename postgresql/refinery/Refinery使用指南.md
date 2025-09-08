@@ -409,7 +409,7 @@ use std::str::FromStr;
 // 嵌入迁移文件
 mod embedded {
     use refinery::embed_migrations;
-    embed_migrations!("./migrations");
+    embed_migrations!("migrations");
 }
 
 pub struct DatabaseManager {
@@ -441,13 +441,19 @@ impl DatabaseManager {
         Ok(Self { client })
     }
 
-    /// 执行嵌入式迁移（生产环境核心功能）
+    /// 执行嵌入式迁移（生产环境核心功能）- 增强版错误处理
     pub async fn safe_migrate(&mut self, database_url: &str) -> Result<()> {
         info!("开始执行数据库迁移...");
         
+        // 检查是否为现有数据库
+        if self.is_existing_database().await? {
+            info!("检测到现有数据库，建立迁移基线...");
+            self.setup_baseline_for_existing_db().await?;
+        }
+        
         // 使用 spawn_blocking 避免运行时冲突
         let database_url_owned = database_url.to_owned();
-        let migration_result = tokio::task::spawn_blocking(move || -> Result<refinery::Report> {
+        let migration_result = tokio::task::spawn_blocking(move || -> Result<refinery::Report, anyhow::Error> {
             // 创建同步连接用于迁移
             let db_config = postgres::Config::from_str(&database_url_owned)
                 .context("解析数据库URL失败")?;
@@ -457,22 +463,253 @@ impl DatabaseManager {
             
             // 执行嵌入的迁移
             let report = embedded::migrations::runner().run(&mut postgres_client)
-                .map_err(|e| anyhow::anyhow!("迁移执行失败: {}", e))?;
+                .map_err(|e| anyhow::anyhow!("Refinery迁移执行失败: {}", e))?;
             
             Ok(report)
         }).await
-        .context("迁移任务执行失败")?
-        .context("迁移操作失败")?;
+        .context("迁移任务执行失败");
         
-        // 输出迁移结果
-        let applied_count = migration_result.applied_migrations().len();
-        if applied_count > 0 {
-            info!("✅ 数据库迁移完成，应用了 {} 个迁移:", applied_count);
-            for migration in migration_result.applied_migrations() {
-                info!("  ✅ V{}: {}", migration.version(), migration.name());
+        // 🆕 增强的错误处理 - 根据结果决定处理方式
+        match migration_result {
+            Ok(Ok(report)) => {
+                // 处理成功结果
+                info!("✅ Refinery数据库迁移完成");
+                info!("已应用的迁移数量: {}", report.applied_migrations().len());
+                
+                for migration in report.applied_migrations() {
+                    info!("  ✅ {}: {}", migration.version(), migration.name());
+                }
+                
+                self.print_migration_status().await?;
+                Ok(())
             }
+            Ok(Err(migration_error)) => {
+                // 🚨 迁移执行出错 - 触发完整的错误处理流程
+                error!("❌ 迁移执行失败，启动错误处理流程...");
+                error!("错误详情: {}", migration_error);
+                
+                // 执行错误处理流程
+                if let Err(handle_err) = self.handle_migration_failure().await {
+                    error!("⚠️  错误处理器本身发生错误: {}", handle_err);
+                }
+                
+                Err(anyhow::anyhow!("迁移执行失败: {}", migration_error))
+            }
+            Err(task_error) => {
+                // 🚨 异步任务执行出错
+                error!("❌ 迁移任务执行失败，启动错误处理流程...");
+                error!("任务错误详情: {}", task_error);
+                
+                // 执行错误处理流程
+                if let Err(handle_err) = self.handle_migration_failure().await {
+                    error!("⚠️  错误处理器本身发生错误: {}", handle_err);
+                }
+                
+                Err(task_error)
+            }
+        }
+    }
+    
+    /// 处理迁移失败的情况
+    pub async fn handle_migration_failure(&mut self) -> Result<()> {
+        error!("🚨 正在处理Refinery迁移失败...");
+        
+        // 生成失败报告
+        if let Err(e) = self.generate_failure_report().await {
+            error!("生成失败报告时出错: {}", e);
+        }
+        
+        // 检查数据完整性
+        if let Err(e) = self.check_data_integrity().await {
+            error!("数据完整性检查时出错: {}", e);
+        }
+        
+        info!("错误处理流程完成");
+        Ok(())
+    }
+    
+    /// 生成详细的失败报告
+    pub async fn generate_failure_report(&mut self) -> Result<()> {
+        info!("📊 生成失败分析报告...");
+        
+        error!("╔════════════════════════════════════════╗");
+        error!("║        Refinery 迁移失败报告            ║");
+        error!("╚════════════════════════════════════════╝");
+        
+        let now = chrono::Utc::now();
+        error!("📅 失败时间: {}", now);
+        
+        // 查询迁移历史
+        let rows = self.client.query(
+            "SELECT version, name, applied_on, checksum 
+             FROM refinery_schema_history 
+             ORDER BY version DESC LIMIT 5",
+            &[]
+        ).await?;
+        
+        error!("📊 迁移历史记录数量: {}", rows.len());
+        error!("📋 最近的迁移记录:");
+        
+        for (index, row) in rows.iter().enumerate() {
+            let version: i32 = row.get("version");
+            let name: String = row.get("name");
+            let applied_on: chrono::DateTime<chrono::Utc> = row.get("applied_on");
+            let checksum: String = row.get("checksum");
+            
+            error!("  {}. V{:03}: {} ({})", 
+                   index + 1, version, name, applied_on);
+            error!("      校验和: {}", checksum);
+        }
+        
+        info!("📁 检查文件系统中的迁移文件...");
+        error!("💾 文件系统状态将需要手动检查");
+        error!("╚════════════════════════════════════════╝");
+        
+        Ok(())
+    }
+    
+    /// 检查数据完整性
+    pub async fn check_data_integrity(&mut self) -> Result<()> {
+        info!("🔍 检查数据完整性...");
+        info!("🔍 开始数据完整性检查...");
+        
+        let critical_tables = vec![
+            ("users", "用户表"),
+            ("products", "产品表"),
+            ("orders", "订单表"),
+            ("refinery_schema_history", "迁移历史表")
+        ];
+        
+        let mut integrity_issues = Vec::new();
+        
+        for (table_name, description) in critical_tables {
+            info!("   检查 {} ({})...", table_name, description);
+            
+            let exists_result = self.client.query_opt(
+                "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = $1)",
+                &[&table_name]
+            ).await?;
+            
+            match exists_result {
+                Some(row) => {
+                    let table_exists: bool = row.get(0);
+                    if table_exists {
+                        // 检查表中的记录数
+                        if table_name == "refinery_schema_history" {
+                            let count_result = self.client.query_one(
+                                &format!("SELECT COUNT(*) FROM {}", table_name),
+                                &[]
+                            ).await?;
+                            let count: i64 = count_result.get(0);
+                            info!("   ✅ {} 正常，包含 {} 行数据", description, count);
+                        } else {
+                            info!("   ✅ {} 存在", description);
+                        }
+                    } else {
+                        warn!("   ❌ 关键表 {} ({}) 不存在", table_name, description);
+                        integrity_issues.push(format!("关键表 {} ({}) 不存在", table_name, description));
+                    }
+                }
+                None => {
+                    warn!("   ❌ 无法检查表 {} ({}) 的存在性", table_name, description);
+                    integrity_issues.push(format!("无法检查表 {} ({})", table_name, description));
+                }
+            }
+        }
+        
+        if !integrity_issues.is_empty() {
+            error!("❌ 发现 {} 个数据完整性问题:", integrity_issues.len());
+            for (index, issue) in integrity_issues.iter().enumerate() {
+                error!("   {}. {}", index + 1, issue);
+            }
+            
+            // 提供恢复建议
+            self.provide_recovery_suggestions().await?;
         } else {
-            info!("✅ 数据库已是最新版本，无需迁移");
+            info!("✅ 数据完整性检查通过，未发现问题");
+        }
+        
+        Ok(())
+    }
+    
+    /// 提供恢复建议
+    pub async fn provide_recovery_suggestions(&mut self) -> Result<()> {
+        error!("╔════════════════════════════════════════╗");
+        error!("║           恢复建议和后续步骤            ║");
+        error!("╚════════════════════════════════════════╝");
+        error!("");
+        error!("🔧 建议的恢复步骤:");
+        error!("   1. 检查错误日志以确定具体的失败原因");
+        error!("   2. 验证数据库连接和权限设置");
+        error!("   3. 检查迁移文件的SQL语法");
+        error!("   4. 考虑从最近的备份恢复（如果有）");
+        error!("   5. 手动修复数据库状态后重新运行迁移");
+        error!("");
+        error!("🚨 立即行动项:");
+        error!("   • 不要删除任何数据");
+        error!("   • 创建当前数据库状态的备份");
+        error!("   • 联系数据库管理员（如果适用）");
+        error!("");
+        error!("📞 如需帮助，请查阅 Refinery 使用指南或联系技术支持");
+        error!("╚════════════════════════════════════════╝");
+        
+        Ok(())
+    }
+
+    /// 检查是否为现有数据库
+    async fn is_existing_database(&self) -> Result<bool> {
+        let rows = self.client.query(
+            "SELECT COUNT(*) as count FROM information_schema.tables 
+             WHERE table_schema = 'public' AND table_type = 'BASE TABLE'",
+            &[]
+        ).await?;
+        
+        let table_count: i64 = rows[0].get("count");
+        Ok(table_count > 0)
+    }
+    
+    /// 为现有数据库设置基线迁移记录
+    async fn setup_baseline_for_existing_db(&mut self) -> Result<()> {
+        // 检查是否已有迁移历史表
+        let has_history = self.client.query_opt(
+            "SELECT 1 FROM information_schema.tables WHERE table_name = 'refinery_schema_history'",
+            &[]
+        ).await?.is_some();
+        
+        if has_history {
+            info!("Refinery迁移基线已存在");
+        } else {
+            info!("为现有数据库建立Refinery基线");
+            // Refinery会自动创建历史表，这里只需记录日志
+        }
+        
+        Ok(())
+    }
+    
+    /// 打印当前迁移状态
+    pub async fn print_migration_status(&self) -> Result<()> {
+        let rows = self.client.query(
+            "SELECT version, name, applied_on 
+             FROM refinery_schema_history 
+             ORDER BY version DESC LIMIT 5",
+            &[]
+        ).await?;
+        
+        if rows.is_empty() {
+            info!("📊 当前没有迁移记录");
+        } else {
+            info!("📊 最近的迁移状态:");
+            for row in &rows {
+                let version: i32 = row.get("version");
+                let name: String = row.get("name");
+                let applied_on: chrono::DateTime<chrono::Utc> = row.get("applied_on");
+                
+                info!("  V{:03}: {} ({})", version, name, applied_on.format("%Y-%m-%d %H:%M:%S"));
+            }
+            
+            // 显示当前版本
+            let current_version: i32 = rows[0].get("version");
+            info!("🏷️  当前数据库版本: V{:03}", current_version);
         }
         
         Ok(())
@@ -831,20 +1068,49 @@ async fn wrong_migrate() {
     embedded::migrations::runner().run(&mut client)?; // 会导致运行时冲突
 }
 
-// 正确的做法 - 使用 spawn_blocking
-async fn correct_migrate() -> Result<()> {
-    let database_url = "postgresql://...".to_owned();
+// 正确的做法 - 使用 spawn_blocking 与增强错误处理
+async fn correct_migrate(&mut self, database_url: &str) -> Result<()> {
+    let database_url_owned = database_url.to_owned();
     
-    let result = tokio::task::spawn_blocking(move || -> Result<refinery::Report> {
-        let db_config = postgres::Config::from_str(&database_url)?;
+    let migration_result = tokio::task::spawn_blocking(move || -> Result<refinery::Report, anyhow::Error> {
+        let db_config = postgres::Config::from_str(&database_url_owned)?;
         let mut client = db_config.connect(postgres::NoTls)?;
-        let report = embedded::migrations::runner().run(&mut client)?;
+        let report = embedded::migrations::runner().run(&mut client)
+            .map_err(|e| anyhow::anyhow!("Refinery迁移执行失败: {}", e))?;
         Ok(report)
-    }).await??;
+    }).await
+    .context("迁移任务执行失败");
     
-    Ok(())
+    // 增强的错误处理
+    match migration_result {
+        Ok(Ok(report)) => {
+            info!("✅ 迁移成功，应用了 {} 个迁移", report.applied_migrations().len());
+            Ok(())
+        }
+        Ok(Err(migration_error)) => {
+            error!("❌ 迁移执行失败，启动错误处理流程...");
+            if let Err(handle_err) = self.handle_migration_failure().await {
+                error!("⚠️ 错误处理器本身发生错误: {}", handle_err);
+            }
+            Err(migration_error)
+        }
+        Err(task_error) => {
+            error!("❌ 迁移任务执行失败");
+            if let Err(handle_err) = self.handle_migration_failure().await {
+                error!("⚠️ 错误处理器本身发生错误: {}", handle_err);
+            }
+            Err(task_error)
+        }
+    }
 }
 ```
+
+**增强错误处理特性**：
+- 🔍 **详细错误分析**: 精确定位问题原因和上下文
+- 📊 **完整失败报告**: 包含迁移历史、时间戳和校验和信息  
+- 🏥 **数据完整性检查**: 验证关键表存在性和数据一致性
+- 💡 **实用恢复建议**: 提供具体的修复步骤和指导
+- 📋 **美观格式化输出**: 清晰易读的错误信息和状态报告
 
 #### 5. 事务相关错误
 
@@ -1141,46 +1407,6 @@ CREATE TABLE IF NOT EXISTS audit_log (
 - **性能影响**: 大表操作是否考虑了性能影响
 - **回滚方案**: 是否有明确的回滚计划
 - **测试覆盖**: 是否在测试环境验证过
-
-#### 2. 自动化质量检查
-
-```yaml
-# .github/workflows/migration-check.yml
-name: Migration Quality Check
-
-on:
-  pull_request:
-    paths: ['migrations/**']
-
-jobs:
-  migration-check:
-    runs-on: ubuntu-latest
-    
-    steps:
-    - uses: actions/checkout@v3
-    
-    - name: Check Migration Naming
-      run: |
-        for file in migrations/V*.sql; do
-          if [[ ! "$file" =~ ^migrations/V[0-9]{3}__[a-z0-9_]+\.sql$ ]]; then
-            echo "❌ Invalid naming: $file"
-            exit 1
-          fi
-        done
-    
-    - name: Check SQL Syntax
-      run: |
-        # 使用 PostgreSQL 客户端检查语法
-        for file in migrations/V*.sql; do
-          psql -d postgres -f "$file" --dry-run || exit 1
-        done
-    
-    - name: Test Migration
-      run: |
-        # 在测试数据库中执行迁移
-        refinery migrate -f
-        refinery migrate
-```
 
 ---
 
