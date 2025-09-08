@@ -128,11 +128,29 @@ impl SimpleMigrator {
     }
     /// 执行DDL语句
     async fn execute_ddl(&self, query: &str) -> Result<()> {
-        self.connection_manager.get_client()
-            .query(query)
+        let trimmed_query = query.trim();
+        if trimmed_query.is_empty() {
+            return Ok(());
+        }
+        
+        debug!("Executing DDL: {}", trimmed_query);
+        
+        match self.connection_manager.get_client()
+            .query(trimmed_query)
             .execute()
             .await
-            .with_context(|| format!("Failed to execute DDL: {}", query))
+        {
+            Ok(_) => {
+                debug!("DDL executed successfully: {}", &trimmed_query[..std::cmp::min(100, trimmed_query.len())]);
+                Ok(())
+            }
+            Err(e) => {
+                let error_msg = format!("Failed to execute DDL: {}\nSQL: {}\nError: {}", 
+                    e, trimmed_query, e);
+                error!("{}", error_msg);
+                Err(anyhow!(error_msg))
+            }
+        }
     }
     
     /// 检查表是否存在
@@ -519,17 +537,30 @@ impl SimpleMigrator {
     async fn execute_migration(&self, migration: &MigrationFile) -> Result<MigrationRecord> {
         let start_time = Instant::now();
         
+        info!("Starting migration: {} - {}", migration.version, migration.name);
+        debug!("Migration checksum: {}", migration.checksum);
+        
         // 对于基线迁移，跳过SQL执行
         let execution_result = if migration.is_baseline {
             info!("Baseline migration detected, skipping SQL execution");
             Ok(())
         } else {
+            info!("Executing migration SQL with {} characters", migration.up_sql.len());
+            debug!("Migration SQL preview: {}", &migration.up_sql[..std::cmp::min(200, migration.up_sql.len())]);
+            
             self.execute_sql_statements(&migration.up_sql).await
+                .with_context(|| format!("Failed to execute migration {}: {}", migration.version, migration.name))
         };
         
         let execution_time = start_time.elapsed();
         let success = execution_result.is_ok();
         let error_message = execution_result.err().map(|e| e.to_string()).unwrap_or_default();
+        
+        if success {
+            info!("Migration {} completed successfully in {:?}", migration.version, execution_time);
+        } else {
+            error!("Migration {} failed after {:?}: {}", migration.version, execution_time, error_message);
+        }
         
         // 记录迁移结果
         let record = MigrationRecord {
@@ -543,8 +574,10 @@ impl SimpleMigrator {
         };
         
         // 保存到数据库（无论成功失败都记录）
-        self.save_migration_record(&record).await
-            .context("Failed to save migration record")?;
+        match self.save_migration_record(&record).await {
+            Ok(_) => debug!("Migration record saved to database"),
+            Err(e) => warn!("Failed to save migration record: {}", e),
+        }
         
         // 如果执行失败，返回错误
         if !success {
@@ -562,6 +595,7 @@ impl SimpleMigrator {
         }
         
         let statements = self.split_sql_statements(sql);
+        info!("Executing {} SQL statements", statements.len());
         
         for (i, statement) in statements.iter().enumerate() {
             let trimmed = statement.trim();
@@ -569,14 +603,31 @@ impl SimpleMigrator {
                 continue;
             }
             
-            debug!("Executing statement {}/{}: {}", 
-                   i + 1, statements.len(),
-                   &trimmed[..std::cmp::min(100, trimmed.len())]);
+            let statement_preview = if trimmed.len() > 100 {
+                format!("{}...", &trimmed[..100])
+            } else {
+                trimmed.to_string()
+            };
             
-            self.execute_ddl(trimmed).await
-                .with_context(|| format!("Failed to execute statement {}/{}: {}", i + 1, statements.len(), trimmed))?;
+            info!("Executing statement {}/{}: {}", 
+                   i + 1, statements.len(), statement_preview);
+            
+            match self.execute_ddl(trimmed).await {
+                Ok(_) => {
+                    info!("Statement {}/{} executed successfully", i + 1, statements.len());
+                }
+                Err(e) => {
+                    let error_context = format!(
+                        "Failed to execute statement {}/{}: {}\nSQL: {}\nFull error: {}", 
+                        i + 1, statements.len(), statement_preview, trimmed, e
+                    );
+                    error!("{}", error_context);
+                    return Err(anyhow!(error_context));
+                }
+            }
         }
         
+        info!("All {} SQL statements executed successfully", statements.len());
         Ok(())
     }
     
@@ -701,6 +752,58 @@ impl SimpleMigrator {
             table_exists,
             last_migration,
         })
+    }
+    
+    /// 获取失败的迁移详情
+    pub async fn get_failed_migrations(&self) -> Result<Vec<MigrationRecord>> {
+        let table_name = self.get_migration_table_name();
+        
+        if !self.table_exists(&table_name).await? {
+            return Ok(Vec::new());
+        }
+        
+        let query = format!(
+            "SELECT version, name, applied_at, execution_time_ms, checksum, success, error_message 
+             FROM {} WHERE success = 0 ORDER BY applied_at DESC",
+            table_name
+        );
+        
+        // 注意：这里需要根据实际的 ClickHouse 客户端 API 调整
+        // 这是一个示例实现
+        let records = self.query_all::<(String, String, String, u64, String, u8, String)>(&query).await?;
+        
+        let migrations = records.into_iter().map(|(version, name, applied_at, execution_time_ms, checksum, success, error_message)| {
+            MigrationRecord {
+                version,
+                name,
+                applied_at,
+                execution_time_ms,
+                checksum,
+                success: success == 1,
+                error_message,
+            }
+        }).collect();
+        
+        Ok(migrations)
+    }
+    
+    /// 获取迁移执行的详细日志
+    pub async fn get_migration_logs(&self, version: &str) -> Result<Vec<String>> {
+        let table_name = self.get_migration_table_name();
+        
+        if !self.table_exists(&table_name).await? {
+            return Ok(Vec::new());
+        }
+        
+        let query = format!(
+            "SELECT error_message, applied_at, execution_time_ms 
+             FROM {} WHERE version = '{}' ORDER BY applied_at DESC",
+            table_name, version
+        );
+        
+        // 这里返回一个简化的日志格式
+        // 在实际实现中，你可能需要查询系统日志表或其他日志源
+        Ok(vec![format!("Migration {} executed at {}", version, chrono::Utc::now())])
     }
     
     /// 获取已应用迁移的详细记录

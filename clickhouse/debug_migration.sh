@@ -1,35 +1,24 @@
 #!/bin/bash
 
-echo "🔍 调试 ClickHouse 迁移检测"
+echo "🔍 ClickHouse 迁移调试工具"
 echo "================================"
 
-# 检查 ClickHouse 服务是否运行
-echo "🔍 检查 ClickHouse 服务状态..."
-if curl -s "http://localhost:8123" > /dev/null; then
-    echo "✅ ClickHouse 服务正在运行"
-else
-    echo "❌ ClickHouse 服务未运行，请先启动服务"
-    echo "💡 提示: 可以使用 Docker 快速启动"
-    echo "   docker run -d --name clickhouse-server -p 8123:8123 -p 9000:9000 clickhouse/clickhouse-server:latest"
-    exit 1
-fi
+# 检查迁移状态
+echo "📊 检查迁移状态..."
+cargo run 2>&1 | grep -E "(迁移状态|成功迁移数|失败迁移数|失败的迁移详情|成功的迁移)"
 
 echo ""
-echo "📁 检查迁移文件..."
-echo "迁移目录: ./migrations"
-ls -la ./migrations/
+echo "🔍 检查失败的迁移..."
+cargo run 2>&1 | grep -A 10 "失败的迁移详情" || echo "没有找到失败的迁移详情"
 
 echo ""
-echo "🚀 运行程序（将显示详细的迁移检测信息）..."
-echo "💡 观察输出，应该能看到："
-echo "  - 扫描到的迁移文件列表"
-echo "  - 迁移表状态检查"
-echo "  - 待处理的迁移列表"
-echo ""
+echo "📋 检查迁移表结构..."
+echo "连接到 ClickHouse 并检查迁移表..."
 
-# 运行程序
-cargo run
-
-echo ""
-echo "🎯 调试完成！"
-echo "💡 如果看到 'V006__改变数据类型' 被检测到，说明问题已解决"
+# 这里可以添加更多的调试命令
+echo "建议的调试步骤："
+echo "1. 检查迁移文件语法是否正确"
+echo "2. 验证 ClickHouse 连接是否正常"
+echo "3. 查看具体的错误日志"
+echo "4. 检查迁移表的记录"
+echo "5. 验证 SQL 语句是否兼容 ClickHouse"
