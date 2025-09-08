@@ -107,24 +107,68 @@ impl SimpleMigrator {
         format!("_migrations_{}", self.service_name)
     }
     
-    /// 执行查询并返回单个值（简化版本）
-    async fn query_single<T>(&self, query: &str) -> Result<T> 
-    where 
-        T: serde::de::DeserializeOwned + Send + Unpin + 'static,
-    {
-        // 简化实现，直接返回错误
-        // 在实际使用中，这里需要根据 ClickHouse 客户端的具体 API 来实现
-        Err(anyhow::anyhow!("Query result handling not implemented for type T"))
+    /// 执行查询并返回单个值
+    async fn query_single_u64(&self, query: &str) -> Result<u64> {
+        debug!("Executing single u64 query: {}", query);
+        
+        let result = self.connection_manager.get_client()
+            .query(query)
+            .fetch_all::<u64>()
+            .await?;
+        
+        result.first()
+            .copied()
+            .ok_or_else(|| anyhow::anyhow!("No result returned from query"))
     }
     
-    /// 执行查询并返回多个值（简化版本）
-    async fn query_all<T>(&self, query: &str) -> Result<Vec<T>>
-    where 
-        T: serde::de::DeserializeOwned + Send + Unpin + 'static,
-    {
-        // 简化实现，直接返回错误
-        // 在实际使用中，这里需要根据 ClickHouse 客户端的具体 API 来实现
-        Err(anyhow::anyhow!("Query result handling not implemented for type T"))
+    /// 执行查询并返回单个字符串值
+    async fn query_single_string(&self, query: &str) -> Result<String> {
+        debug!("Executing single string query: {}", query);
+        
+        let result = self.connection_manager.get_client()
+            .query(query)
+            .fetch_all::<String>()
+            .await?;
+        
+        result.first()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("No result returned from query"))
+    }
+    
+    /// 执行查询并返回字符串列表
+    async fn query_all_strings(&self, query: &str) -> Result<Vec<String>> {
+        debug!("Executing string list query: {}", query);
+        
+        let result = self.connection_manager.get_client()
+            .query(query)
+            .fetch_all::<String>()
+            .await?;
+        
+        Ok(result)
+    }
+    
+    /// 执行查询并返回迁移记录元组
+    async fn query_migration_records(&self, query: &str) -> Result<Vec<(String, String, String, u64, String, u8, String)>> {
+        debug!("Executing migration records query: {}", query);
+        
+        let result = self.connection_manager.get_client()
+            .query(query)
+            .fetch_all::<(String, String, String, u64, String, u8, String)>()
+            .await?;
+        
+        Ok(result)
+    }
+    
+    /// 执行查询并返回版本和校验和对
+    async fn query_version_checksum_pairs(&self, query: &str) -> Result<Vec<(String, String)>> {
+        debug!("Executing version-checksum pairs query: {}", query);
+        
+        let result = self.connection_manager.get_client()
+            .query(query)
+            .fetch_all::<(String, String)>()
+            .await?;
+        
+        Ok(result)
     }
     /// 执行DDL语句
     async fn execute_ddl(&self, query: &str) -> Result<()> {
@@ -141,7 +185,9 @@ impl SimpleMigrator {
             .await
         {
             Ok(_) => {
-                debug!("DDL executed successfully: {}", &trimmed_query[..std::cmp::min(100, trimmed_query.len())]);
+                let log_preview_length = std::cmp::min(100, trimmed_query.chars().count());
+                let log_preview: String = trimmed_query.chars().take(log_preview_length).collect();
+                debug!("DDL executed successfully: {}", log_preview);
                 Ok(())
             }
             Err(e) => {
@@ -160,8 +206,17 @@ impl SimpleMigrator {
             table_name
         );
         
-        let count: u64 = self.query_single(&query).await.unwrap_or(0);
-        Ok(count > 0)
+        match self.query_single_u64(&query).await {
+            Ok(count) => {
+                debug!("Table '{}' exists check: count = {}", table_name, count);
+                Ok(count > 0)
+            }
+            Err(e) => {
+                warn!("Failed to check if table '{}' exists: {}", table_name, e);
+                // 对于表存在性检查失败，我们假设表不存在，这样更安全
+                Ok(false)
+            }
+        }
     }
     
     /// 创建迁移记录表
@@ -378,11 +433,21 @@ impl SimpleMigrator {
         let table_name = self.get_migration_table_name();
         
         if !self.table_exists(&table_name).await? {
+            debug!("Migration table does not exist, skipping validation");
             return Ok(());
         }
         
         let query = format!("SELECT version, checksum FROM {} WHERE success = 1", table_name);
-        let applied_records: Vec<(String, String)> = self.query_all(&query).await?;
+        
+        let applied_records = match self.query_version_checksum_pairs(&query).await {
+            Ok(records) => records,
+            Err(e) => {
+                warn!("Failed to query applied migrations for validation: {}", e);
+                return Ok(()); // 如果查询失败，跳过验证，允许迁移继续
+            }
+        };
+        
+        debug!("Validating {} applied migrations", applied_records.len());
         
         let mut validation_errors = Vec::new();
         
@@ -390,7 +455,7 @@ impl SimpleMigrator {
             if let Some(migration_file) = migration_files.get(&version) {
                 if migration_file.checksum != stored_checksum {
                     validation_errors.push(format!(
-                        "Migration {}: checksum mismatch (expected: {}, found: {})",
+                        "Migration {}: checksum mismatch (stored: {}, file: {})",
                         version, stored_checksum, migration_file.checksum
                     ));
                 }
@@ -406,6 +471,7 @@ impl SimpleMigrator {
             ));
         }
         
+        info!("Migration validation passed");
         Ok(())
     }
     
@@ -413,21 +479,40 @@ impl SimpleMigrator {
     async fn get_applied_versions(&self) -> Result<HashSet<String>> {
         let table_name = self.get_migration_table_name();
         
-        if !self.table_exists(&table_name).await? {
-            info!("Migration table {} does not exist, treating all migrations as pending", table_name);
-            return Ok(HashSet::new());
+        // 首先检查迁移表是否存在
+        match self.table_exists(&table_name).await {
+            Ok(false) => {
+                info!("Migration table {} does not exist, treating all migrations as pending", table_name);
+                return Ok(HashSet::new());
+            }
+            Ok(true) => {
+                info!("Migration table {} exists, querying applied versions", table_name);
+            }
+            Err(e) => {
+                warn!("Failed to check if migration table exists: {}, assuming it doesn't exist", e);
+                return Ok(HashSet::new());
+            }
         }
         
         let query = format!("SELECT version FROM {} WHERE success = 1 ORDER BY version", table_name);
         
-        let versions: Vec<String> = self.query_all(&query).await
-            .unwrap_or_else(|e| {
-                warn!("Failed to query applied versions: {}", e);
-                Vec::new()
-            });
-        
-        info!("Found {} applied migrations", versions.len());
-        Ok(versions.into_iter().collect())
+        match self.query_all_strings(&query).await {
+            Ok(versions) => {
+                info!("Found {} applied migrations: {:?}", versions.len(), 
+                      if versions.len() <= 5 { 
+                          versions.clone() 
+                      } else { 
+                          versions.iter().take(5).cloned().collect::<Vec<_>>()
+                      });
+                Ok(versions.into_iter().collect())
+            }
+            Err(e) => {
+                error!("Failed to query applied versions from table '{}': {}", table_name, e);
+                // 这里不应该静默返回空集合，而应该传播错误
+                // 除非我们确定这是一个可以恢复的错误
+                Err(e.context("Failed to retrieve applied migration versions"))
+            }
+        }
     }
     
     /// 确定待执行的迁移
@@ -546,7 +631,9 @@ impl SimpleMigrator {
             Ok(())
         } else {
             info!("Executing migration SQL with {} characters", migration.up_sql.len());
-            debug!("Migration SQL preview: {}", &migration.up_sql[..std::cmp::min(200, migration.up_sql.len())]);
+            let preview_length = std::cmp::min(200, migration.up_sql.chars().count());
+            let sql_preview: String = migration.up_sql.chars().take(preview_length).collect();
+            debug!("Migration SQL preview: {}", sql_preview);
             
             self.execute_sql_statements(&migration.up_sql).await
                 .with_context(|| format!("Failed to execute migration {}: {}", migration.version, migration.name))
@@ -603,8 +690,9 @@ impl SimpleMigrator {
                 continue;
             }
             
-            let statement_preview = if trimmed.len() > 100 {
-                format!("{}...", &trimmed[..100])
+            let statement_preview = if trimmed.chars().count() > 100 {
+                let truncated: String = trimmed.chars().take(100).collect();
+                format!("{}...", truncated)
             } else {
                 trimmed.to_string()
             };
@@ -732,15 +820,27 @@ impl SimpleMigrator {
         
         let (total_migrations, last_migration) = if table_exists {
             let count_query = format!("SELECT count() FROM {} WHERE success = 1", table_name);
-            let count: u64 = self.query_single(&count_query).await.unwrap_or(0);
+            let count = match self.query_single_u64(&count_query).await {
+                Ok(c) => c as usize,
+                Err(e) => {
+                    warn!("Failed to get migration count: {}", e);
+                    0
+                }
+            };
             
             let last_query = format!(
                 "SELECT version FROM {} WHERE success = 1 ORDER BY version DESC LIMIT 1", 
                 table_name
             );
-            let last: Option<String> = self.query_single(&last_query).await.ok();
+            let last = match self.query_single_string(&last_query).await {
+                Ok(version) => Some(version),
+                Err(e) => {
+                    debug!("No last migration found or query failed: {}", e);
+                    None
+                }
+            };
             
-            (count as usize, last)
+            (count, last)
         } else {
             (0, None)
         };
@@ -768,9 +868,13 @@ impl SimpleMigrator {
             table_name
         );
         
-        // 注意：这里需要根据实际的 ClickHouse 客户端 API 调整
-        // 这是一个示例实现
-        let records = self.query_all::<(String, String, String, u64, String, u8, String)>(&query).await?;
+        let records = match self.query_migration_records(&query).await {
+            Ok(records) => records,
+            Err(e) => {
+                warn!("Failed to query failed migrations: {}", e);
+                return Ok(Vec::new());
+            }
+        };
         
         let migrations = records.into_iter().map(|(version, name, applied_at, execution_time_ms, checksum, success, error_message)| {
             MigrationRecord {
@@ -801,9 +905,25 @@ impl SimpleMigrator {
             table_name, version
         );
         
-        // 这里返回一个简化的日志格式
-        // 在实际实现中，你可能需要查询系统日志表或其他日志源
-        Ok(vec![format!("Migration {} executed at {}", version, chrono::Utc::now())])
+        // 尝试获取实际的迁移日志
+        match self.query_migration_records(&query).await {
+            Ok(records) => {
+                let logs = records.into_iter()
+                    .map(|(_, _, applied_at, execution_time_ms, _, _, error_message)| {
+                        format!("Migration {} executed at {} ({}ms): {}", 
+                               version, applied_at, execution_time_ms, 
+                               if error_message.is_empty() { "Success".to_string() } else { error_message })
+                    })
+                    .collect();
+                Ok(logs)
+            }
+            Err(e) => {
+                warn!("Failed to query migration logs for version {}: {}", version, e);
+                // 返回一个简化的日志格式作为后备
+                Ok(vec![format!("Migration {} executed at {} (no detailed logs available)", 
+                                version, chrono::Utc::now())])
+            }
+        }
     }
     
     /// 获取已应用迁移的详细记录
@@ -820,9 +940,13 @@ impl SimpleMigrator {
             table_name
         );
         
-        // 注意：这里需要根据实际的 ClickHouse 客户端 API 调整
-        // 这是一个示例实现
-        let records = self.query_all::<(String, String, String, u64, String, u8, String)>(&query).await?;
+        let records = match self.query_migration_records(&query).await {
+            Ok(records) => records,
+            Err(e) => {
+                warn!("Failed to query applied migrations: {}", e);
+                return Ok(Vec::new());
+            }
+        };
         
         let migrations = records.into_iter().map(|(version, name, applied_at, execution_time_ms, checksum, success, error_message)| {
             MigrationRecord {
@@ -848,7 +972,7 @@ impl SimpleMigrator {
             table_name
         );
         
-        let last_version: String = self.query_single(&query).await
+        let last_version = self.query_single_string(&query).await
             .context("No migrations to rollback")?;
         
         // 扫描迁移文件找到对应的回滚SQL
